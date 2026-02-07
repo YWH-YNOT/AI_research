@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# 数据集
+data/
+*.zip
+*.tar
+*.gz
+
+# 检查点
+checkpoints/*.pth.tar
+!checkpoints/.gitkeep
+
+# 日志
+logs/
+runs/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

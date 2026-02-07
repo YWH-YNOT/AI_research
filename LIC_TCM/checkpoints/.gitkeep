@@ -1,0 +1,2 @@
+# 此文件用于保留 checkpoints 目录在 git 中
+# 实际的模型权重文件会被 .gitignore 忽略
