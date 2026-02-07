@@ -1,181 +1,144 @@
-#!/usr/bin/env python3
-"""
-TCM 模型评估脚本
-用于在 Kodak/Tecnick 测试集上评估模型性能
-"""
-
 import argparse
-import time
-from pathlib import Path
-from collections import defaultdict
-
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import numpy as np
-from tqdm import tqdm
+from torchvision import transforms
+import os
+import math
+import glob
+import time
 
+# =========================================================
+# 关键修改：告诉 Python 去 'models' 文件夹里找 tcm
+# =========================================================
+try:
+    from models.tcm import TCM
+except ImportError:
+    # 备用方案：万一你在 models 目录下运行
+    try:
+        from tcm import TCM
+    except ImportError:
+        print("❌ 严重错误：找不到 tcm.py！")
+        print("请确认你的目录结构是：")
+        print("  - LIC_TCM/")
+        print("    - eval.py")
+        print("    - models/")
+        print("      - tcm.py")
+        exit(1)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TCM 模型评估")
-
-    parser.add_argument("-c", "--checkpoint", type=str, required=True,
-                        help="预训练模型路径")
-    parser.add_argument("-d", "--dataset", type=str, required=True,
-                        help="测试集目录路径")
-    parser.add_argument("-o", "--output", type=str, default="output",
-                        help="重建图像保存目录")
-    parser.add_argument("--cuda", action="store_true",
-                        help="使用 CUDA")
-
+    parser = argparse.ArgumentParser(description="TCM 模型评估脚本")
+    parser.add_argument("-c", "--checkpoint", type=str, required=True, help="模型权重路径 (.pth.tar)")
+    parser.add_argument("-d", "--data", type=str, required=True, help="测试图片文件夹路径")
+    parser.add_argument("--cuda", action="store_true", default=True, help="使用 GPU")
     return parser.parse_args()
 
-
-def compute_psnr(img1, img2):
-    """计算 PSNR"""
-    mse = torch.mean((img1 - img2) ** 2).item()
+def compute_psnr(a, b):
+    mse = torch.mean((a - b)**2).item()
     if mse == 0:
-        return float("inf")
-    return 20 * np.log10(255.0 / np.sqrt(mse))
+        return 100
+    return -10 * math.log10(mse)
 
-
-def compute_ms_ssim(img1, img2):
-    """计算 MS-SSIM (简化版，完整版需要 pytorch_msssim 库)"""
-    # 这里仅作为占位符
-    from compressai.metrics import ms_ssim
-    return ms_ssim(img1, img2)
-
-
-def load_image(image_path):
-    """加载图像"""
-    img = Image.open(image_path).convert("RGB")
-    img = np.array(img).astype(np.float32)
-    img = torch.from_numpy(img).permute(2, 0, 1)  # C x H x W
-    return img.unsqueeze(0)  # 添加 batch 维度
-
-
-def save_image(tensor, save_path):
-    """保存图像"""
-    img = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    img = np.clip(img, 0, 255).astype(np.uint8)
-    Image.fromarray(img).save(save_path)
-
-
-def evaluate(model, dataset_dir, device, output_dir=None):
-    """评估模型"""
-    dataset_dir = Path(dataset_dir)
-    image_files = sorted(dataset_dir.glob("*.png")) + sorted(dataset_dir.glob("*.jpg"))
-
-    if not image_files:
-        print(f"错误: 在 {dataset_dir} 中没有找到图像文件")
-        return
-
-    print(f"找到 {len(image_files)} 张测试图像")
-
-    model.eval()
-
-    metrics = defaultdict(list)
-
-    with torch.no_grad():
-        for img_path in tqdm(image_files, desc="评估中"):
-            # 加载图像
-            img = load_image(img_path).to(device)
-
-            # 前向传播
-            start_time = time.time()
-            output = model(img)
-            encode_time = time.time() - start_time
-
-            reconstructed = output["x_hat"]
-
-            # 计算 BPP
-            num_pixels = img.size(0) * img.size(2) * img.size(3)
-            bpp = sum(
-                (torch.log(likelihoods).sum() / (-np.log(2) * num_pixels))
-                for likelihoods in output["likelihoods"].values()
-            ).item()
-
-            # 计算 PSNR
-            psnr = compute_psnr(reconstructed, img)
-
-            # 计算 MS-SSIM
-            try:
-                ms_ssim_val = compute_ms_ssim(reconstructed, img)
-            except:
-                ms_ssim_val = 0.0
-
-            # 记录指标
-            metrics["psnr"].append(psnr)
-            metrics["bpp"].append(bpp)
-            metrics["ms_ssim"].append(ms_ssim_val.item() if torch.is_tensor(ms_ssim_val) else ms_ssim_val)
-            metrics["encode_time"].append(encode_time)
-
-            # 保存重建图像
-            if output_dir:
-                output_dir = Path(output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-                save_path = output_dir / img_path.name
-                save_image(reconstructed, save_path)
-
-    # 打印结果
-    print("\n" + "=" * 60)
-    print("评估结果 (平均):")
-    print("=" * 60)
-    print(f"PSNR:    {np.mean(metrics['psnr']):.4f} dB")
-    print(f"BPP:     {np.mean(metrics['bpp']):.4f}")
-    print(f"MS-SSIM: {np.mean(metrics['ms_ssim']):.4f}")
-    print(f"编码时间: {np.mean(metrics['encode_time'])*1000:.2f} ms")
-    print("=" * 60)
-
-    return metrics
-
+def compute_bpp(out_net):
+    size = out_net['x_hat'].size()
+    num_pixels = size[0] * size[2] * size[3]
+    return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+              for likelihoods in out_net['likelihoods'].values()).item()
 
 def main():
     args = parse_args()
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    # 设备
-    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    print(f"🔄 正在初始化模型 (TCM-Small)...")
+    # 初始化 TCM 模型 (Small 版本配置)
+    model = TCM(config=[2, 2, 2, 2, 2, 2], head=[8, 16, 32, 32, 16, 8])
+    model = model.to(device)
+    model.eval()
 
-    # 加载模型
-    print(f"加载模型: {args.checkpoint}")
+    # 加载权重
+    print(f"📂 正在加载权重: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device)
-
-    # 尝试获取模型架构
+    
+    # 兼容处理：检查是否有 'state_dict' 键
     if "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
+        
+    # 加载参数
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        # 尝试去除 module. 前缀 (多卡训练常见问题)
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k.replace("module.", "") 
+            new_state_dict[name] = v
+        model.load_state_dict(new_state_dict)
 
-    # 根据模型类型创建模型
-    # 这里需要根据实际保存的模型类型来创建
-    from compressai.models import BMSHJ2018Factorized
+    print("✅ 模型加载成功！开始评估...")
 
-    # 简化处理：使用默认模型
-    # 实际应根据模型参数选择正确的模型
-    model = BMSHJ2018Factorized(quality=3, pretrained=False)
-    model.load_state_dict(state_dict)
-    model = model.to(device)
+    # 准备图片变换
+    transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
 
-    # 评估
-    metrics = evaluate(model, args.dataset, device, args.output)
+    # 获取所有图片 (递归查找)
+    # 支持 png 和 jpg
+    img_paths = glob.glob(os.path.join(args.data, "*.png")) + \
+                glob.glob(os.path.join(args.data, "*.jpg"))
+    
+    if not img_paths:
+        print(f"⚠️  警告：在路径 {args.data} 下没有找到 .png 或 .jpg 图片！")
+        return
 
-    # 保存结果
-    if args.output:
-        import json
-        output_dir = Path(args.output)
-        results_file = output_dir / "metrics.json"
+    # 统计指标
+    total_psnr = 0
+    total_bpp = 0
+    count = 0
+    
+    with torch.no_grad():
+        for img_path in img_paths:
+            # 读取图片
+            img = Image.open(img_path).convert('RGB')
+            x = transform(img).unsqueeze(0).to(device)
 
-        with open(results_file, "w") as f:
-            json.dump({
-                "psnr": float(np.mean(metrics["psnr"])),
-                "bpp": float(np.mean(metrics["bpp"])),
-                "ms_ssim": float(np.mean(metrics["ms_ssim"])),
-                "encode_time": float(np.mean(metrics["encode_time"])),
-            }, f, indent=2)
+            # Padding: 确保长宽是 64 的倍数
+            h, w = x.size(2), x.size(3)
+            p_h = (64 - (h % 64)) % 64
+            p_w = (64 - (w % 64)) % 64
+            if p_h != 0 or p_w != 0:
+                x = F.pad(x, (0, p_w, 0, p_h), mode='reflect')
 
-        print(f"结果已保存到: {results_file}")
+            start_time = time.time()
+            out_net = model(x)
+            elapsed = time.time() - start_time
 
+            # 裁剪回原来的尺寸
+            x_hat = out_net['x_hat']
+            x_hat = x_hat[:, :, :h, :w]
+            x = x[:, :, :h, :w] # 裁剪原图以便对比
+
+            # 限制值范围
+            x_hat.clamp_(0, 1)
+            
+            psnr = compute_psnr(x, x_hat)
+            bpp = compute_bpp(out_net)
+            
+            total_psnr += psnr
+            total_bpp += bpp
+            count += 1
+            
+            print(f"🖼️  {os.path.basename(img_path)} | Bpp: {bpp:.4f} | PSNR: {psnr:.2f} dB | ⏱️  {elapsed:.3f}s")
+
+    # 打印平均结果
+    if count > 0:
+        print("=" * 40)
+        print(f"📊 平均结果 ({count} 张图片):")
+        print(f"   平均 Bpp:  {total_bpp / count:.4f}")
+        print(f"   平均 PSNR: {total_psnr / count:.2f} dB")
+        print("=" * 40)
 
 if __name__ == "__main__":
     main()
